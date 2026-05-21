@@ -115,7 +115,7 @@ _panel.id = 'panel';
 _panel.innerHTML = `
   <div id="header">
     <div>
-      <div id="app-name"><img alt="POTSPOT" style="width:100px" src="data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%20encoding%3D%22UTF-8%22%20standalone%3D%22no%22%3F%3E%3C!DOCTYPE%20svg%20PUBLIC%20%22-%2F%2FW3C%2F%2FDTD%20SVG%201.1%2F%2FEN%22%20%22http%3A%2F%2Fwww.w3.org%2FGraphics%2FSVG%2F1.1%2FDTD%2Fsvg11.dtd%22%3E%3Csvg%20width%3D%22100%25%22%20height%3D%22100%25%22%20viewBox%3D%220%200%201140%20214%22%20version%3D%221.1%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20xmlns%3Axlink%3D%22http%3A%2F%2Fwww.w3.org%2F1999%2Fxlink%22%20xml%3Aspace%3D%22preserve%22%20xmlns%3Aserif%3D%22http%3A%2F%2Fwww.serif.com%2F%22%20style%3D%22fill-rule%3Aevenodd%3Bclip-rule%3Aevenodd%3Bstroke-linejoin%3Around%3Bstroke-miterlimit%3A2%3B%22%3E%3Cg%20transform%3D%22matrix(1%2C0%2C0%2C1%2C-246%2C10)%22%3E%3Ctext%20x%3D%22239px%22%20y%3D%22191px%22%20style%3D%22font-family%3A'BalooBhaijaan-Regular'%2C%20'Baloo%20Bhaijaan'%2C%20cursive%3Bfont-size%3A306.667px%3Bfill%3Argb(92%2C184%2C92)%3B%22%3EP%3C%2Ftext%3E%3Ctext%20x%3D%22405.213px%22%20y%3D%22191px%22%20style%3D%22font-family%3A'BalooBhaijaan-Regular'%2C%20'Baloo%20Bhaijaan'%2C%20cursive%3Bfont-size%3A266.667px%3Bfill%3Argb(92%2C184%2C92)%3B%22%3EO%3Ctspan%20x%3D%22573.747px%20%22%20y%3D%22191px%20%22%3ET%3C%2Ftspan%3E%3C%2Ftext%3E%3Ctext%20x%3D%22747.613px%22%20y%3D%22191px%22%20style%3D%22font-family%3A'BalooBhaijaan-Regular'%2C%20'Baloo%20Bhaijaan'%2C%20cursive%3Bfont-size%3A306.667px%3Bfill%3Argb(92%2C184%2C92)%3B%22%3ES%3C%2Ftext%3E%3Cg%20transform%3D%22matrix(266.666667%2C0%2C0%2C266.666667%2C1423.413333%2C191)%22%3E%3C%2Fg%3E%3Ctext%20x%3D%22905.547px%22%20y%3D%22191px%22%20style%3D%22font-family%3A'BalooBhaijaan-Regular'%2C%20'Baloo%20Bhaijaan'%2C%20cursive%3Bfont-size%3A266.667px%3Bfill%3Argb(92%2C184%2C92)%3B%22%3EP%3Ctspan%20x%3D%221051.147px%201221.813px%20%22%20y%3D%22191px%20191px%20%22%3EOT%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fsvg%3E"/></div>
+      <div id="app-name"><img alt="POTSPOT" id="topLogo" style="width:100px" /></div>
       <div id="status">Loading OpenCV&hellip;</div>
     </div>
     <div id="header-actions">
@@ -146,6 +146,8 @@ _panel.innerHTML = `
   <div id="table-section"></div>
 `;
 shadow.appendChild(_panel);
+
+shadow.getElementById('topLogo').src = chrome.runtime.getURL('img/potspot_logo_sidebar.svg');
 
 const canvas = document.createElement('canvas');
 canvas.id = 'tableCanvas';
@@ -957,14 +959,64 @@ const DISP_H  = Math.round(DISP_W * SVG_H / SVG_W);
 const DPR     = window.devicePixelRatio || 1;
 
 // CSS size = logical display size; pixel size = DPR× for sharp retina rendering.
-canvas.style.width  = DISP_W + 'px';
-canvas.style.height = DISP_H + 'px';
+// CSS width:100% / height:auto lets the canvas scale with the (variable) sidebar
+// width while keeping its 380:720 intrinsic aspect ratio. The internal bitmap
+// stays at DISP_W × DISP_H so drawing code and eventToCanvas() are unchanged.
+canvas.style.width  = '100%';
+canvas.style.height = 'auto';
 canvas.width  = DISP_W * DPR;
 canvas.height = DISP_H * DPR;
 
 const S   = DISP_W / SVG_W;   // scale: SVG native px → CSS px (drawing coords)
 const ctx = canvas.getContext('2d');
 ctx.scale(DPR, DPR);           // all drawing ops now work in CSS px
+
+// ── Responsive sidebar sizing ────────────────────────────────────────────────
+// Sidebar width tracks the window: default 380 px, clamped to 20–25 % of the
+// window width.  If the resulting sidebar would be taller than the viewport
+// (header/controls + table-at-2× width), shrink the width so the table fits.
+const SIDEBAR_DEFAULT_W = 380;
+const SIDEBAR_MIN_W     = 200;
+function _resizeSidebar() {
+  const winW = window.innerWidth;
+  const winH = window.innerHeight;
+
+  // Measure unzoomed fixed-UI height by temporarily resetting zoom.
+  const headerEl   = shadow.getElementById('header');
+  const controlsEl = shadow.getElementById('controls');
+  headerEl.style.zoom   = 1;
+  controlsEl.style.zoom = 1;
+  const fixedH0 = headerEl.getBoundingClientRect().height
+                + controlsEl.getBoundingClientRect().height;
+
+  // The whole sidebar scales as one unit: fixedH = fixedH0 × zoom, tableH = 2 × width,
+  // zoom = width / SIDEBAR_DEFAULT_W.  Total height = width × (fixedH0/380 + 2).
+  // Max width that fits the viewport:
+  const maxW = winH / (fixedH0 / SIDEBAR_DEFAULT_W + 2);
+  // Desired width: default clamped to [20%, 25%] of window, then capped by maxW.
+  let width = Math.max(0.20 * winW, Math.min(SIDEBAR_DEFAULT_W, 0.25 * winW));
+  width = Math.max(SIDEBAR_MIN_W, Math.min(width, maxW));
+
+  const zoom = width / SIDEBAR_DEFAULT_W;
+  shadowHost.style.width        = width + 'px';
+  headerEl.style.zoom           = zoom;
+  controlsEl.style.zoom         = zoom;
+  const blurEl = shadow.getElementById('blur-banner');
+  const warnEl = shadow.getElementById('unsanctioned-banner');
+  if (blurEl) blurEl.style.zoom = zoom;
+  if (warnEl) warnEl.style.zoom = zoom;
+}
+
+let _resizePending = false;
+window.addEventListener('resize', () => {
+  if (_resizePending) return;
+  _resizePending = true;
+  requestAnimationFrame(() => {
+    _resizePending = false;
+    _resizeSidebar();
+  });
+});
+_resizeSidebar();
 
 // Radius of the SVG pocket circles in canvas px (r=1.55 viewBox units).
 const POCKET_R = 1.55 * (SVG_W / 75.779997) * S;
