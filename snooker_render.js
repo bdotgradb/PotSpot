@@ -156,6 +156,35 @@ shadow.getElementById('table-section').appendChild(canvas);
 // ── Panel logic ───────────────────────────────────────────────────────────────
 function setStatus(msg) { shadow.getElementById('status').textContent = msg; }
 
+// chrome.runtime.sendMessage wrapper that fails gracefully if the extension
+// context has been invalidated (extension reloaded/updated while this page
+// stayed open). chrome.runtime.id goes undefined when that happens and any
+// sendMessage call throws synchronously. All context-touching button actions
+// funnel through here so the guard lives in one place.
+function safeSendMessage(msg, cb) {
+  if (!chrome.runtime?.id) {
+    setStatus('Extension was updated — please refresh the page.');
+    return;
+  }
+  try {
+    chrome.runtime.sendMessage(msg, cb);
+  } catch (e) {
+    setStatus('Extension error — please refresh the page.');
+  }
+}
+
+// Bug-report contact, persisted in extension storage (chrome.storage.local, not
+// the host page's localStorage). Cached here in page context so the modal can be
+// populated synchronously; the cache is refreshed at load and written back async
+// whenever the user submits a changed value.
+let _cachedContact = '';
+if (chrome.runtime?.id) {
+  chrome.storage.local.get('potspot_contact', (data) => {
+    if (chrome.runtime.lastError) return;
+    _cachedContact = data?.potspot_contact || '';
+  });
+}
+
 // Called by snooker_detect.js once OpenCV has loaded.
 function onCvReady() { setStatus('Ready — click Scan.'); }
 
@@ -452,7 +481,7 @@ function _renderDebugToPng(info) {
 shadow.getElementById('close-btn').addEventListener('click', () => {
   shadowHost.style.display = 'none';
   clearDebugOverlay();
-  chrome.runtime.sendMessage({ action: 'removeCSS' });
+  safeSendMessage({ action: 'removeCSS' });
 });
 
 shadow.getElementById('debug-btn').addEventListener('click', () => {
@@ -464,15 +493,23 @@ shadow.getElementById('debug-btn').addEventListener('click', () => {
 
 // ── Scan helpers ──────────────────────────────────────────────────────────────
 
-// ── Submission modal (body level — full-viewport overlay) ────────────────────
-// Built at body level rather than inside the shadow DOM so it can cover the
-// full viewport and isn't clipped to the 380 px panel width.
+// ── Submission modal ─────────────────────────────────────────────────────────
+// Lives in its own full-viewport shadow host so the host site's CSS, DOM
+// mutations, and overlays can't disturb it. (The panel's own shadow host is
+// only a 380px strip, so the modal needs a separate full-screen host.)
+// The host's display is toggled to show/hide — when hidden it doesn't cover the
+// page. _setModalOpen() is the single open/close entry point.
+const _modalHost = document.createElement('div');
+_modalHost.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:none;';
+document.body.appendChild(_modalHost);
+const _modalShadow = _modalHost.attachShadow({ mode: 'open' });
+function _setModalOpen(open) { _modalHost.style.display = open ? 'block' : 'none'; }
+
 const _modalStyle = document.createElement('style');
 _modalStyle.textContent = `
-  #__ps-modal { position:fixed; inset:0; background:rgba(0,0,0,0.78);
-    z-index:2147483647; display:none; align-items:center; justify-content:center;
+  #__ps-modal { position:absolute; inset:0; background:rgba(0,0,0,0.78);
+    display:flex; align-items:center; justify-content:center;
     font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif; }
-  #__ps-modal.open { display:flex; }
   #__ps-modal-box { background:#0f1f0f; border:1px solid #2a5a2a; border-radius:12px;
     padding:24px 28px; width:440px; max-width:calc(100vw - 32px); color:#9aba9a; }
   #__ps-modal h3 { margin:0 0 8px; color:#5cb85c; font-size:1rem; font-weight:700; }
@@ -501,7 +538,7 @@ _modalStyle.textContent = `
     font-family:inherit; }
   #__ps-send:hover { background:#3a9a3a; }
 `;
-document.head.appendChild(_modalStyle);
+_modalShadow.appendChild(_modalStyle);
 
 const _submitModal = document.createElement('div');
 _submitModal.id = '__ps-modal';
@@ -520,7 +557,7 @@ _submitModal.innerHTML = `
     </div>
     <div class="ps-field">
       <label for="__ps-contact">Contact <span style="font-weight:400;color:#4a7a4a">(optional)</span></label>
-      <input type="text" id="__ps-contact" placeholder="Email, Twitter handle, etc">
+      <input type="text" id="__ps-contact" placeholder="Email, Social media handle, etc">
       <p class="ps-hint">Optional. Email/handle/etc — only used to follow up on this report.</p>
     </div>
     <p class="ps-privacy">No other personal data is collected or transmitted.</p>
@@ -530,18 +567,23 @@ _submitModal.innerHTML = `
     </div>
   </div>
 `;
-document.body.appendChild(_submitModal);
+_modalShadow.appendChild(_submitModal);
 
-document.getElementById('__ps-cancel').addEventListener('click', () => {
-  _submitModal.classList.remove('open');
+_modalShadow.getElementById('__ps-cancel').addEventListener('click', () => {
+  _setModalOpen(false);
 });
 
-document.getElementById('__ps-send').addEventListener('click', async () => {
-  _submitModal.classList.remove('open');
+_modalShadow.getElementById('__ps-send').addEventListener('click', async () => {
+  _setModalOpen(false);
 
-  const contact     = document.getElementById('__ps-contact').value.trim();
-  const description = document.getElementById('__ps-desc').value.trim();
-  if (contact) localStorage.setItem('potspot_contact', contact);
+  const contact     = _modalShadow.getElementById('__ps-contact').value.trim();
+  const description = _modalShadow.getElementById('__ps-desc').value.trim();
+  // Update the page-context cache immediately, then async-write back to extension
+  // storage if it changed (no callback needed — fire and forget).
+  if (contact && contact !== _cachedContact) {
+    _cachedContact = contact;
+    if (chrome.runtime?.id) chrome.storage.local.set({ potspot_contact: contact });
+  }
 
   setStatus('Submitting…');
   try {
@@ -559,7 +601,7 @@ document.getElementById('__ps-send').addEventListener('click', async () => {
       debugBase64 = btoa(binary);
     }
 
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action:         'submitBug',
       tabUrl:         window.location.href,
       balls:          JSON.stringify(balls),
@@ -598,8 +640,10 @@ document.getElementById('__ps-send').addEventListener('click', async () => {
 // page's window listener which would otherwise call preventDefault().
 for (const evType of ['keydown', 'keyup', 'keypress']) {
   window.addEventListener(evType, e => {
-    if (!_submitModal.classList.contains('open')) return;
-    if (_submitModal.contains(e.target)) return; // handled by layer 2
+    if (_modalHost.style.display === 'none') return;      // modal closed
+    // Shadow DOM retargets e.target to the host at window level, so check the
+    // composed path to tell whether the key was typed inside the modal.
+    if (e.composedPath().includes(_submitModal)) return;  // handled by layer 2
     e.stopPropagation();
     e.preventDefault();
   }, { capture: true });
@@ -613,11 +657,10 @@ shadow.getElementById('submit-btn').addEventListener('click', () => {
     setStatus('Nothing to submit — click Scan Table first.');
     return;
   }
-  // Pre-populate contact from localStorage if previously saved.
-  const saved = localStorage.getItem('potspot_contact');
-  document.getElementById('__ps-contact').value = saved || '';
-  document.getElementById('__ps-desc').value = '';
-  _submitModal.classList.add('open');
+  // Pre-populate contact from the cached copy (loaded from extension storage).
+  _modalShadow.getElementById('__ps-contact').value = _cachedContact;
+  _modalShadow.getElementById('__ps-desc').value = '';
+  _setModalOpen(true);
 });
 
 // ── Scan helpers ──────────────────────────────────────────────────────────────
@@ -671,12 +714,16 @@ function _setAutoBtn(mode) {  // 'auto' | 'cancel' | 'disabled'
 // cb(err, dataUrl, balls, debugInfo)
 function _doCapture(checkOnly, cb) {
   function attempt(n) {
-    chrome.runtime.sendMessage({ action: 'capture' }, (resp) => {
+    safeSendMessage({ action: 'capture' }, (resp) => {
       if (chrome.runtime.lastError || !resp || resp.error) {
         if (n < 3) { setTimeout(() => attempt(n + 1), 500 * Math.pow(2, n)); return; }
         cb('Capture failed.', null, null, null); return;
       }
-      waitForCvThenDetect(resp.dataUrl, window.screen.width, (balls, debugInfo) => {
+      waitForCvThenDetect(resp.dataUrl, window.screen.width, (balls, debugInfo, error) => {
+        if (error === 'csp') {
+          cb("This site blocks the screenshot from loading (Content Security Policy), so detection can't run here. Please file a bug report.", null, null, null);
+          return;
+        }
         cb(null, resp.dataUrl, balls, debugInfo);
       }, true, true, checkOnly);
     });
@@ -869,12 +916,12 @@ function _runAutoScan() {
 
 shadow.getElementById('auto-btn').addEventListener('click', () => {
   if (_autoScanActive) { _autoScanActive = false; return; }
-  chrome.runtime.sendMessage({ action: 'sendStats', uuid: window.__potspotStatsUUID, site: window.__potspotSite, eventAction: 'scan' });
+  safeSendMessage({ action: 'sendStats', uuid: window.__potspotStatsUUID, site: window.__potspotSite, eventAction: 'scan' });
   _runAutoScan();
 });
 
 shadow.getElementById('detect-btn').addEventListener('click', () => {
-  chrome.runtime.sendMessage({ action: 'sendStats', uuid: window.__potspotStatsUUID, site: window.__potspotSite, eventAction: 'scan' });
+  safeSendMessage({ action: 'sendStats', uuid: window.__potspotStatsUUID, site: window.__potspotSite, eventAction: 'scan' });
   // Single scan — disable both scan buttons for the duration.
   _setScanBtn('disabled');
   _setAutoBtn('disabled');

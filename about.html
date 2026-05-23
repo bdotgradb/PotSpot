@@ -48,8 +48,8 @@
     .credit { display: flex; flex-direction: column; gap: 2px; }
     .credit-title { color: #a0c0a0; font-size: 0.85rem; }
     .credit-detail { font-size: 0.78rem; color: #5a8a5a; }
-    .credit-detail a { color: #4a9a4a; text-decoration: none; }
-    .credit-detail a:hover { text-decoration: underline; }
+    .credit-detail a, p a { color: #4a9a4a; text-decoration: none; }
+    .credit-detail a:hover, p a:hover { text-decoration: underline; }
 
     /* ── Links ── */
     .link-row { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -60,7 +60,30 @@
       transition: background 0.15s, border-color 0.15s;
     }
     .link-btn:hover { background: #162e16; border-color: #2a6a2a; }
-
+.lp-btn {
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 48px;
+    padding: 6px;
+    background: #332a22;
+    border: 1px solid #322a1a;
+    border-radius: 4px;
+    color: #504030;
+    cursor: pointer;
+    box-shadow: 0 2px 0 #080604, inset 0 1px 0 rgba(255, 255, 255, 0.04), inset 0 -1px 4px rgba(0, 0, 0, 0.6);
+    transition: background 0.08s, border-color 0.08s, color 0.08s, box-shadow 0.08s;
+    user-select: none;
+    flex-shrink: 0;
+    zoom:0.8;
+    margin:6px;
+    margin-left:0;
+}
+.lp-btn img {
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+}
     /* ── Footer ── */
     footer { font-size: 0.72rem; color: #2a4a2a; padding-top: 16px;
              border-top: 1px solid #142a14; }
@@ -71,21 +94,32 @@
 
     <div class="header">
       <div class="logo">PotSpot</div>
-      <div class="tagline">Snooker ball detector for BBC iPlayer</div>
-      <div class="version">Version 1.1</div>
+      <div class="tagline">Snooker ball detector for online snooker streams</div>
+      <div class="version" id="version"></div>
     </div>
 
     <section>
       <h2>About</h2>
       <p>
-        PotSpot detects snooker balls in BBC iPlayer livestreams and renders
+        PotSpot detects the table and balls in snooker livestreams and renders
         an interactive top-down plan view of the table. Click any ball to
         see aim lines and object-ball deflections.
       </p>
+      <p>More information and privacy policy at <a href="https://potspot.net/">potspot.net</a></p>
       <p>
         Detection runs entirely in the browser — no data
-        leaves your device apart from completely anonymous usage stats (basically, how many times Detect gets clicked).
+        leaves your device apart from completely anonymous usage stats (basically, how many times Scan gets clicked).
       </p>
+    </section>
+    <section>
+      <h2>Accuracy</h2>
+      <p>
+        The resolution of a stream has fewer pixels than a snooker table has millimetres. Therefore balls might be very slightly off: there's nothing we can do about that apart from demand 4k streams and watch them on 4k monitors.
+      </p>
+      <p>
+        Accuracy is mostly affected by poor quality blurry video, which happens either if you have low bandwidth or you're watching cheap coverage (eg snooker900.tv): the extension will warn you if video isn't crisp. If you see baulk colours slightly drift off their spots on some scans, this is almost always down to video quality.
+      </p>
+        
     </section>
 
     <section>
@@ -128,16 +162,22 @@
     <section>
       <h2>Help &amp; Issues</h2>
       <p>Found a bug or want to suggest a feature?</p>
-      <div class="link-row">
-        <a class="link-btn" href="https://github.com/oliverhumpage/snookerplot/issues"
-           target="_blank" rel="noopener">Report an issue</a>
-      </div>
+
+      <span class="credit-detail">Please click <button class="lp-btn"><img src="img/bugreport.svg" /></button> on the right of the sidebar if the detection isn't correct.</span>
+	  <br />
+      <span class="credit-detail">You can also 
+        <a href="https://github.com/oliverhumpage/potspot/issues"
+           target="_blank" rel="noopener">report an issue on github</a>
+      </span>
+	  <br />
+      <span class="credit-detail">Or you can email snooker at potspot dot net</span>
     </section>
 
     <footer>
-      PotSpot is an independent project and is not affiliated with the BBC or World Snooker.
+      PotSpot is an independent project and is not affiliated with any website or World Snooker.
     </footer>
 
   </main>
+  <script src="about.js"></script>
 </body>
 </html>

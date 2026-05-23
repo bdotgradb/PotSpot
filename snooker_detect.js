@@ -25,6 +25,10 @@ function detectBalls(dataUrl, windowWidth, cb, debugMode, olsSides, checkOnly) {
     const balls = detector.detections;
     cb(balls, detector.debugInfo);
   };
+  // The dataUrl is a screenshot we generated, so the only realistic decode
+  // failure is the host page's CSP blocking data: URLs in img-src. Signal that
+  // up the callback chain rather than hanging forever on a never-firing onload.
+  img.onerror = () => cb(null, null, 'csp');
   img.src = dataUrl;
   return;
 }
@@ -1360,7 +1364,7 @@ class SnookerDetector {
   _matchHSV(H, S, V) {
     if (V < 60)                                  return this.COLOURS[6]; // Black
     if ((H < 10 || H > 165) && S > 35 && V>200) return this.COLOURS[5]; // Pink
-    if ((H < 10 || H > 163) && S > 90)          return this.COLOURS[7]; // Red
+    if ((H < 15 || H > 163) && S > 90)          return this.COLOURS[7]; // Red
     if (H >= 5  && H < 30 && S > 120 && V < 180) return this.COLOURS[3]; // Brown
     if (H >= 18 && H < 36 && S > 110)           return this.COLOURS[1]; // Yellow
     if (H >= 38 && H < 78 && S > 50 && V < 168) return this.COLOURS[2]; // Green
@@ -1504,9 +1508,9 @@ class SnookerDetector {
     const OVERLAP_DIST = 1.8;   // ×r — reject if another ball centre is this close
     const HOUGH_PARAM1 = 30;    // Canny high threshold (low = sensitive edges)
     const HOUGH_PARAM2 = 10;    // accumulator threshold (low = accept weak circles)
-    const HOUGH_R_LO   = 0.65;  // min accepted radius as fraction of expected r
-    const HOUGH_R_HI   = 1.35;  // max accepted radius as fraction of expected r
-    const HOUGH_REACH  = 1.5;   // max distance (×r) from expected centre to accepted circle
+    const HOUGH_R_LO   = 0.8;  // min accepted radius as fraction of expected r
+    const HOUGH_R_HI   = 1.2;  // max accepted radius as fraction of expected r
+    const HOUGH_REACH  = 1.3;   // max distance (×r) from expected centre to accepted circle
 
     return detections.filter(d => {
       if (d.colour.name !== 'Green') return true;
@@ -1603,7 +1607,8 @@ class SnookerDetector {
   // Priority 1: any unknown ('?') ball that looks vaguely brown.
   // Priority 2: a red that is measurably more orange than the other reds.
   _rescueBrown(detections, hsv) {
-    const BROWN_HUE_DIST = 8;  // min gap (in OpenCV hue units, 0-179) to trigger red rescue
+    const BROWN_HUE_DIST = 5;  // min gap (in OpenCV hue units, 0-179) to trigger red rescue
+    const BROWN_HUE_DIST_MAX = 15;  // max gap (in OpenCV hue units, 0-179) to trigger red rescue, as sometimes we get weirdly high differences
 
     const hasName = n => detections.some(d => d.colour.name === n);
     if (hasName('Brown')) return detections;
@@ -1656,12 +1661,12 @@ class SnookerDetector {
     // Non-redness: min(H, 179-H) so 0 = pure red, higher = more orange/brown.
     const nonRedness = d => {
       const { H } = sampleHSV(d);
-      return Math.min(H, 179 - H);
+      let Hdist = Math.min(H, 179 - H);
+      return Hdist < BROWN_HUE_DIST_MAX ? Hdist : 0 ;
     };
 
     const scored = reds.map(r => ({ r, score: nonRedness(r) }));
     scored.sort((a, b) => b.score - a.score);
-
     const candidate = scored[0];
     const othersMedian = this.median(scored.slice(1).map(s => s.score));
     if (candidate.score - othersMedian < BROWN_HUE_DIST) return detections;
@@ -1704,6 +1709,29 @@ class SnookerDetector {
     }
     if ((bl.y - tl.y) / imgH < 0.35) {
       return { suitable: false, reason: 'Full table not visible', contours: [], blurScore: null };
+    }
+    // Reject lopsided views (often a close-up of part of the table misread as a
+    // full one): in a genuine angled shot the two side edges slant inward by
+    // mirror-image amounts, so the left edge's horizontal run (tl.x − bl.x)
+    // should be within tolerance of the right edge's (br.x − tr.x).
+    const SIDE_SYM_TOL = 0.1;
+    const leftDx  = Math.abs(tl.x - bl.x);
+    const rightDx = Math.abs(br.x - tr.x);
+    const maxDx   = Math.max(leftDx, rightDx);
+    if (maxDx > 0 && Math.abs(leftDx - rightDx) / maxDx > SIDE_SYM_TOL) {
+      return { suitable: false, reason: 'Table view not straight-on', contours: [], blurScore: null };
+    }
+    // Reject overhead/landscape views: in a normal angled shot perspective makes the
+    // bottom frame line noticeably longer than the top.  If top and bottom are about
+    // equal (within 5%) AND the horizontal frame lines are ≥ 1.5× the vertical ones,
+    // the table is being shown flat-on in landscape — not a usable broadcast angle.
+    const _dist = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+    const topLen = _dist(tl, tr), botLen = _dist(bl, br);
+    const horizAvg = (topLen + botLen) / 2;
+    const vertAvg  = (_dist(tl, bl) + _dist(tr, br)) / 2;
+    if (Math.abs(topLen - botLen) / Math.max(topLen, botLen) <= 0.05 &&
+        horizAvg >= 1.5 * vertAvg) {
+      return { suitable: false, reason: 'Overhead shot', contours: [], blurScore: null };
     }
 	//if (widthRatio < 1) {
     if ((br.x-bl.x)/pixelDensity < MINWIDTH) {
