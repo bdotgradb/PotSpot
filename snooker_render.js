@@ -106,6 +106,10 @@ style.textContent = `
   #unsanctioned-banner-close { float:right; background:none; border:none;
     color:#c8b060; font-size:14px; cursor:pointer; padding:0 0 0 8px; line-height:1; }
   #blur-banner { display:none; }
+  #window-banner { display:none; background:#2a0c0c; border-bottom:1px solid #6a1a1a;
+    padding:10px 14px; font-size:0.74rem; color:#f0b0b0; line-height:1.5; font-weight:600; }
+  #window-banner-dismiss { display:none; margin-top:8px; background:none; border:none;
+    color:#f08080; font-size:0.7rem; cursor:pointer; padding:0; text-decoration:underline; }
 `;
 shadow.appendChild(style);
 
@@ -119,7 +123,7 @@ _panel.innerHTML = `
       <div id="status">Loading OpenCV&hellip;</div>
     </div>
     <div id="header-actions">
-      <button id="debug-btn" title="Toggle debug overlay"><span id="debug-led"></span>Debug</button>
+      <button id="debug-btn" title="Toggle debug overlay" style="display:none"><span id="debug-led"></span>Debug</button>
       <button id="close-btn" title="Close">&#x2715;</button>
     </div>
   </div>
@@ -193,6 +197,85 @@ const _blurBanner = document.createElement('div');
 _blurBanner.id = 'blur-banner';
 _blurBanner.textContent = '⚠ Low quality video — ball detection will be affected';
 shadow.getElementById('controls').insertAdjacentElement('afterend', _blurBanner);
+
+// ── Window-size nudge banner (red; more prominent than the blur banner) ───────
+// Shown at most once per session, only when the detected table is below the
+// recommended width AND the window has room to grow.  Takes priority over the
+// blur banner (we never show both).  The "don't show again" link is withheld on
+// the first warning and appears only on subsequent ones (a reflexive click then
+// is at least an informed one).  Dismissal + show-count persist in extension
+// storage; the per-session guard lives in page context.
+const WINDOW_NEAR_MAX = 0.9;   // ≥90% of available screen counts as "already maximised"
+const WINDOW_NUDGE_REPEAT_MS = 30000;  // keep showing on scans within 30s of the first
+
+let _windowNudgeDismissed   = false;
+let _windowNudgeShownCount  = 0;
+let _windowNudgeShownAt      = null;   // timestamp of current episode's first showing (null = no active episode)
+let _windowNudgeCountedThisSession = false;  // counter is bumped at most once per session
+if (chrome.runtime?.id) {
+  chrome.storage.local.get('potspot_windowNudge', (data) => {
+    if (chrome.runtime.lastError) return;
+    const w = data?.potspot_windowNudge;
+    if (w) { _windowNudgeDismissed = !!w.dismissed; _windowNudgeShownCount = w.count || 0; }
+  });
+}
+function _persistWindowNudge() {
+  if (chrome.runtime?.id) {
+    chrome.storage.local.set({
+      potspot_windowNudge: { count: _windowNudgeShownCount, dismissed: _windowNudgeDismissed },
+    });
+  }
+}
+
+const _windowBanner = document.createElement('div');
+_windowBanner.id = 'window-banner';
+_windowBanner.innerHTML =
+  '<div>⚠ Small window — accuracy will be poor. '
+  + 'Maximise your browser window for the best results.</div>'
+  + '<button id="window-banner-dismiss" title="Stop showing this">Don’t show this again</button>';
+shadow.getElementById('controls').insertAdjacentElement('afterend', _windowBanner);
+shadow.getElementById('window-banner-dismiss').addEventListener('click', () => {
+  _windowNudgeDismissed = true;
+  _persistWindowNudge();
+  _windowBanner.style.display = 'none';
+});
+
+// True when maximising would meaningfully enlarge the window (so we don't nag
+// someone who's already at/near full screen — there the limit is the stream).
+function _windowHasRoomToGrow() {
+  return window.outerWidth  < screen.availWidth  * WINDOW_NEAR_MAX ||
+         window.outerHeight < screen.availHeight * WINDOW_NEAR_MAX;
+}
+
+// Decide whether to show the window-size nudge for this scan.  Returns true if
+// shown (caller then suppresses the blur banner).  It stays visible on every
+// qualifying scan within WINDOW_NUDGE_REPEAT_MS of the first, then hides for the
+// rest of the session.  The show-counter increments only once per session (on
+// the first showing), so the "don't show again" link never appears in session 1.
+function _maybeShowWindowNudge(cc) {
+  if (!cc?.tableSmall) return false;
+  if (_windowNudgeDismissed) return false;
+  if (!_windowHasRoomToGrow()) return false;
+
+  const now = Date.now();
+  if (_windowNudgeShownAt === null) {
+    _windowNudgeShownAt = now;
+    if (!_windowNudgeCountedThisSession) {   // bump the counter once per session only
+      _windowNudgeCountedThisSession = true;
+      _windowNudgeShownCount++;
+      _persistWindowNudge();
+    }
+    shadow.getElementById('window-banner-dismiss').style.display =
+      _windowNudgeShownCount >= 2 ? 'inline' : 'none';   // no opt-out on the first warning
+    _windowBanner.style.display = 'block';
+    return true;
+  }
+  if (now - _windowNudgeShownAt <= WINDOW_NUDGE_REPEAT_MS) {
+    _windowBanner.style.display = 'block';
+    return true;
+  }
+  return false;   // past the repeat window — hide for the rest of the session
+}
 
 // ── Unsanctioned-site notice ──────────────────────────────────────────────────
 if (window.__potspotWarning === 'unsanctioned') {
@@ -491,6 +574,24 @@ shadow.getElementById('debug-btn').addEventListener('click', () => {
   else clearDebugOverlay();
 });
 
+// Debug button visibility is opt-in via the "Show debug button" toggle in the
+// about page. Hidden by default in markup; we reveal it (and watch for live
+// toggles from the about tab) via extension storage.
+function _applyShowDebug(on) {
+  shadow.getElementById('debug-btn').style.display = on ? '' : 'none';
+}
+if (chrome.runtime?.id) {
+  chrome.storage.local.get('potspot_showDebug', (data) => {
+    if (chrome.runtime.lastError) return;
+    _applyShowDebug(!!data?.potspot_showDebug);
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.potspot_showDebug) {
+      _applyShowDebug(!!changes.potspot_showDebug.newValue);
+    }
+  });
+}
+
 // ── Scan helpers ──────────────────────────────────────────────────────────────
 
 // ── Submission modal ─────────────────────────────────────────────────────────
@@ -690,6 +791,7 @@ function _collapseToIdle() {
   _panel.classList.remove('tableHidden');
   _panel.classList.add('compact');
   _blurBanner.style.display = 'none';
+  _windowBanner.style.display = 'none';
   shadow.getElementById('table-section').style.display = 'none';
   shadow.getElementById('hide-btn').disabled = true;
   shadow.getElementById('hide-btn').textContent = 'Hide';
@@ -751,7 +853,9 @@ function _renderResults(dataUrl, detections, debugInfo) {
     _collapseToIdle();
     setStatus(_clearCheckReason);
   } else {
-    _blurBanner.style.display = cc?.blurry ? 'block' : 'none';
+    const nudged = _maybeShowWindowNudge(cc);
+    if (!nudged) _windowBanner.style.display = 'none';
+    _blurBanner.style.display = (!nudged && cc?.blurry) ? 'block' : 'none';
     _panel.classList.remove('compact');
     _panel.classList.remove('tableHidden');
     shadowHost.style.height = '100vh';
@@ -1050,8 +1154,10 @@ function _resizeSidebar() {
   controlsEl.style.zoom         = zoom;
   const blurEl = shadow.getElementById('blur-banner');
   const warnEl = shadow.getElementById('unsanctioned-banner');
+  const winEl  = shadow.getElementById('window-banner');
   if (blurEl) blurEl.style.zoom = zoom;
   if (warnEl) warnEl.style.zoom = zoom;
+  if (winEl)  winEl.style.zoom  = zoom;
 }
 
 let _resizePending = false;
@@ -1061,6 +1167,11 @@ window.addEventListener('resize', () => {
   requestAnimationFrame(() => {
     _resizePending = false;
     _resizeSidebar();
+    // Re-arm the window-size nudge: a resize ends the current episode and hides
+    // the banner, so the next qualifying scan can show it again for another 30s.
+    // The show-counter is untouched, so this never surfaces the opt-out link mid-session.
+    _windowNudgeShownAt = null;
+    _windowBanner.style.display = 'none';
   });
 });
 _resizeSidebar();
@@ -1621,6 +1732,29 @@ canvas.addEventListener('mousemove', e => {
 
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
+// ── Space → play/pause the site video ─────────────────────────────────────────
+// The <video> is buried in open shadow roots, so reach it with a deep query that
+// pierces them, scoped to the BBC player container when present (falls back to
+// the whole document for other sites). The result is cached until disconnected.
+let _cachedVideo = null;
+function _deepQueryVideo(root) {
+  const v = root.querySelector('video');
+  if (v) return v;
+  for (const el of root.querySelectorAll('*')) {
+    if (el.shadowRoot) {
+      const r = _deepQueryVideo(el.shadowRoot);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+function findVideo() {
+  if (_cachedVideo && _cachedVideo.isConnected) return _cachedVideo;
+  const host = document.getElementById('toucan-bbcMediaPlayer0');
+  _cachedVideo = _deepQueryVideo(host || document);
+  return _cachedVideo;
+}
+
 document.addEventListener('keydown', e => {
   if (shadowHost.style.display === 'none') return; // panel closed
 
@@ -1628,6 +1762,12 @@ document.addEventListener('keydown', e => {
   if (tag === 'INPUT' || tag === 'TEXTAREA') return; // don't steal from text fields
 
   const isMod = e.metaKey || e.ctrlKey;
+
+  if ((e.key === ' ' || e.code === 'Space') && !isMod) {
+    const v = findVideo();
+    if (v) { v.paused ? v.play().catch(() => {}) : v.pause(); e.preventDefault(); }
+    return;
+  }
 
   if (e.key === 'Escape') {
     if (_autoScanActive) {

@@ -1685,6 +1685,9 @@ class SnookerDetector {
   // Returns { suitable, reason, contours[] } in full-res image-pixel coords.
   checkTableClear(rgb, highlights, gray = null) {
 	const MINWIDTH = 500;
+	// Above MINWIDTH the table is usable; below RECOMMENDEDWIDTH it's small enough
+	// that the render side may nudge the user to enlarge their window.
+	const RECOMMENDEDWIDTH = MINWIDTH * 1.5;
     const td    = this.tableData;
 
 	const pixelDensity = this.srcMat.cols/this.windowWidth;
@@ -2016,6 +2019,7 @@ class SnookerDetector {
       }
     }
 
+    const playWidthCss = (br.x - bl.x) / pixelDensity;
     return {
       suitable:        !obstructionFound,
       hasObstruction:  obstructionFound,
@@ -2023,6 +2027,8 @@ class SnookerDetector {
       contours,
       blurScore,
       blurry,
+      tableSmall:      playWidthCss < RECOMMENDEDWIDTH,
+      playWidthCss:    Math.round(playWidthCss),
     };
   }
 
