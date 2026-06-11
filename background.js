@@ -6,6 +6,7 @@ function getSiteName(url) {
   if (/https?:\/\/[^.]*\.?bbc\.co\.uk/.test(url))   return 'bbc';
   if (/https?:\/\/[^.]*\.?channel5\.com/.test(url)) return 'channel5';
   if (/https?:\/\/[^.]*\.?snooker900\.tv/.test(url)) return 'snooker900';
+  if (/https?:\/\/[^.]*\.?wst\.tv\/(live|videos)/.test(url)) return 'wst';
   if (/https?:\/\/[^.]*\.?youtube\.com/.test(url)) return 'youtube';
   if (/https?:\/\/[^.]*\.?potspot\.net\/.+/.test(url)) return 'potspotdebug';
   return null;
@@ -237,12 +238,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         const fd = new FormData();
-        fd.append('tab_url',      msg.tabUrl);
-        fd.append('balls',        msg.balls);
-        fd.append('contact',      msg.contact      ?? '');
-        fd.append('description',  msg.description  ?? '');
-        fd.append('windowWidth',  msg.windowWidth  ?? '');
-        fd.append('windowHeight', msg.windowHeight ?? '');
+        fd.append('tab_url',          msg.tabUrl);
+        fd.append('balls',            msg.balls);
+        fd.append('contact',          msg.contact          ?? '');
+        fd.append('description',      msg.description      ?? '');
+        fd.append('windowWidth',      msg.windowWidth      ?? '');
+        fd.append('windowHeight',     msg.windowHeight     ?? '');
+        fd.append('clearCheckReason', msg.clearCheckReason ?? '');
+        fd.append('blurScore',        msg.blurScore        ?? '');
 
         const screenshotBlob = await fetch(msg.screenshotUrl).then(r => r.blob());
         fd.append('screenshot', screenshotBlob, 'window.jpg');

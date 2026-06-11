@@ -1,0 +1,13 @@
+section.header-container,
+nav.video-viewer-subnav
+{
+	display:none!important;
+}
+
+.video__container {
+	padding-top:0!important;
+}
+.max-width-container {
+	padding-left:0!important;
+	max-width:100%!important;
+}

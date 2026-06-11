@@ -9,6 +9,7 @@ shadowHost.style.cssText = [
 document.body.appendChild(shadowHost);
 const shadow = shadowHost.attachShadow({ mode: 'open' });
 
+window.__snookerScan   = () => { shadow.getElementById('detect-btn').click(); };
 window.__snookerToggle = function () {
   const wasHidden = shadowHost.style.display === 'none';
   shadowHost.style.display = wasHidden ? '' : 'none';
@@ -307,6 +308,9 @@ function clearDebugOverlay() {
 }
 
 // Core drawing logic, shared between the live overlay and the submission PNG export.
+// All coordinates are raw captured-image space — detection never rotates the
+// image, so everything aligns with the screen directly (the tilt correction is
+// applied analytically inside the detector's mm mapping only).
 function _drawDebugInfo(ctx, info) {
   const s = info.imgWidth / window.innerWidth;
   ctx.save();
@@ -326,7 +330,7 @@ function _drawDebugInfo(ctx, info) {
 
     // Frame lines — cyan
     ctx.strokeStyle = 'rgba(0,220,220,0.85)';
-    ctx.lineWidth = 2 * s;
+    ctx.lineWidth = 1 * s;
     for (const l of tl.frame || []) {
       ctx.beginPath(); ctx.moveTo(l.x1, l.y1); ctx.lineTo(l.x2, l.y2); ctx.stroke();
     }
@@ -334,6 +338,14 @@ function _drawDebugInfo(ctx, info) {
     // Play-area lines — orange
     ctx.strokeStyle = 'rgba(255,150,0,0.9)';
     for (const l of tl.playArea || []) {
+      ctx.beginPath(); ctx.moveTo(l.x1, l.y1); ctx.lineTo(l.x2, l.y2); ctx.stroke();
+    }
+
+    // Raw fitted nose lines — magenta, full frame-row span (not truncated at
+    // the offset corners like the orange ones), so the straight-line fit can
+    // be checked against the real cushion edges at the extreme bottom.
+    ctx.strokeStyle = 'rgba(255,0,255,0.9)';
+    for (const l of tl.noseLines || []) {
       ctx.beginPath(); ctx.moveTo(l.x1, l.y1); ctx.lineTo(l.x2, l.y2); ctx.stroke();
     }
 
@@ -373,7 +385,7 @@ function _drawDebugInfo(ctx, info) {
     ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
     ctx.setLineDash([]);
     ctx.fillStyle = 'rgba(255,140,0,0.85)';
-    for (const ep of edgePts || []) ctx.fillRect(ep.x - 1.5 * s, ep.y - 1.5 * s, 3 * s, 3 * s);
+    for (const ep of edgePts || []) ctx.fillRect(ep.x - 0.5 * s, ep.y - 0.5 * s, 1 * s, 1 * s);
     if (topX !== undefined) {
       const arm = 5 * s;
       ctx.strokeStyle = 'rgba(0,255,80,0.9)';
@@ -413,20 +425,19 @@ function _drawDebugInfo(ctx, info) {
     }
   }
 
-  // ── Detected balls: coloured circle + yellow crosshair + colour initial ────
-  function hexRgba(hex, a) {
-    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
-    return `rgba(${r},${g},${b},${a})`;
-  }
+  // ── Detected balls: black (or white for the black ball) circle + yellow
+  //    crosshair + colour initial ─────────────────────────────────────────────
   for (const d of info.rawDetections || []) {
-    const sw = d.swatch === '#ffffff' ? '#cccccc' :
-               d.swatch === '#333333' ? '#aaaaaa' : d.swatch;
+    // Use black for visibility against the baize; flip to white only for the
+    // black ball where black would disappear.
+    const a   = d.recovered ? 0.6 : d.adjusted ? 0.7 : 1.0;
+    const rgb = d.name === 'Black' ? '255,255,255' : '0,0,0';
 
     ctx.beginPath();
-    ctx.arc(d.cx, d.cy, d.r + 2 * s, 0, Math.PI * 2);
+    ctx.arc(d.cx, d.cy, d.r , 0, Math.PI * 2);
     ctx.setLineDash(d.recovered ? [2 * s, 3 * s] : d.adjusted ? [4 * s, 3 * s] : []);
-    ctx.strokeStyle = hexRgba(sw, d.recovered ? 0.6 : d.adjusted ? 0.7 : 1.0);
-    ctx.lineWidth = 2.5 * s;
+    ctx.strokeStyle = `rgba(${rgb},${a})`;
+    ctx.lineWidth = 1 * s;
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -450,6 +461,57 @@ function _drawDebugInfo(ctx, info) {
     ctx.strokeText(lbl, d.cx - 4 * s, d.cy + 4 * s);
     ctx.fillStyle = 'rgba(255,255,255,0.9)';
     ctx.fillText(lbl, d.cx - 4 * s, d.cy + 4 * s);
+  }
+
+  // ── Diagnostic readout — top-left, key fitted numbers ──────────────────────
+  if (info.diag) {
+    const d = info.diag;
+    const lines = [
+      `cushionW ${d.cushionWidthMm} mm`,
+      `roll ${d.rotationDeg}°  tiltDiff ${d.tiltDiffDeg}°  shear ${d.shearDyPx ?? 0}px`,
+      `Wtop ${d.wTopPx}px  Wbot ${d.wBotPx}px`,
+      `frameSpan ${d.frameSpanPx}px`,
+    ];
+    ctx.font = `bold ${12 * s}px Courier New`;
+    let ty = 20 * s;
+    for (const txt of lines) {
+      ctx.lineWidth = 3 * s;
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.strokeText(txt, 8 * s, ty);
+      ctx.fillStyle = 'rgba(0,255,160,0.95)';
+      ctx.fillText(txt, 8 * s, ty);
+      ty += 15 * s;
+    }
+
+    // Per-row diagnostics: nose width, play-area width, predicted ball size
+    if (d.rows) {
+      ty += 4 * s;
+      ctx.font = `bold ${11 * s}px Courier New`;
+      for (const r of d.rows) {
+        const pct = Math.round(r.frac * 100);
+        const txt = `${pct}%: noW=${r.noseWidthPx} paW=${r.paWidthPx} bD(no)=${r.ballDiamNosePx} bD(pa)=${r.ballDiamPaPx}`;
+        ctx.lineWidth = 3 * s;
+        ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+        ctx.strokeText(txt, 8 * s, ty);
+        ctx.fillStyle = 'rgba(255,220,80,0.95)';
+        ctx.fillText(txt, 8 * s, ty);
+        ty += 14 * s;
+
+        // Hollow square at table centre, sized by nose-predicted ball diameter
+        const cx = r.centerX, cy = r.y;
+        const half = r.ballDiamNosePx / 2;
+        ctx.strokeStyle = 'rgba(255,220,80,0.9)';
+        ctx.lineWidth = 1.5 * s;
+        ctx.setLineDash([]);
+        ctx.strokeRect((cx - half), (cy - half), r.ballDiamNosePx, r.ballDiamNosePx);
+
+        // Second hollow square for play-area-predicted size (cyan)
+        const halfPa = r.ballDiamPaPx / 2;
+        ctx.strokeStyle = 'rgba(0,220,255,0.7)';
+        ctx.lineWidth = 1 * s;
+        ctx.strokeRect((cx - halfPa), (cy - halfPa), r.ballDiamPaPx, r.ballDiamPaPx);
+      }
+    }
   }
 
   // ── Clear-check contours ────────────────────────────────────────────────────
@@ -703,16 +765,18 @@ _modalShadow.getElementById('__ps-send').addEventListener('click', async () => {
     }
 
     safeSendMessage({
-      action:         'submitBug',
-      tabUrl:         window.location.href,
-      balls:          JSON.stringify(balls),
+      action:           'submitBug',
+      tabUrl:           window.location.href,
+      balls:            JSON.stringify(balls),
       contact,
       description,
       debugBase64,
-      windowWidth:    _lastWindowWidth,
-      windowHeight:   _lastWindowHeight,
-      screenshotUrl:  _lastScreenshotUrl,  // pass from content script — background's
-                                           // copy is lost if service worker restarted
+      windowWidth:      _lastWindowWidth,
+      windowHeight:     _lastWindowHeight,
+      screenshotUrl:    _lastScreenshotUrl,  // pass from content script — background's
+                                             // copy is lost if service worker restarted
+      clearCheckReason: _lastDebugInfo?.clearCheck?.reason   ?? null,
+      blurScore:        _lastDebugInfo?.clearCheck?.blurScore ?? null,
     }, (result) => {
       if (chrome.runtime.lastError) {
         setStatus('Submission error: ' + chrome.runtime.lastError.message);
@@ -1211,19 +1275,21 @@ function resolveOverlaps(balls) {
 
   // Pre-cull — side cushion overlap > 40 % of ball area.
   // Catches false detections from the top-pocket linings, which sit well outside
-  // the playing area in x.  Area check (not just offset) means a ball genuinely
-  // in a corner-pocket jaw — partially outside x but with most of its area still
-  // over the table — is preserved.  Top/bottom walls are intentionally excluded:
-  // pocket-jaw balls there can legitimately sit at y < R.
+  // the playing area in x.  Exempt balls whose y falls inside a corner- or
+  // middle-pocket jaw zone: those are legitimately near a side-cushion opening
+  // (including balls sitting in a corner pocket whose x maps outside the area).
+  const MID = PLAY_H_MM / 2;
   for (let i = balls.length - 1; i >= 0; i--) {
     const b = balls[i];
-    if (capFrac(b.x) > 0.4 || capFrac(PLAY_W_MM - b.x) > 0.4) balls.splice(i, 1);
+    const inSideJawY = b.y < JAW_C || b.y > PLAY_H_MM - JAW_C ||
+                       (b.y >= MID - JAW_M && b.y <= MID + JAW_M);
+    if (!inSideJawY && (capFrac(b.x) > 0.4 || capFrac(PLAY_W_MM - b.x) > 0.4))
+      balls.splice(i, 1);
   }
 
   // Phase 1 — cushion snap with pocket-jaw awareness.
   // Skip the snap for each wall when the ball's position projects onto a pocket
   // opening on that wall, matching the JAW geometry used by findBoundaryHit.
-  const MID = PLAY_H_MM / 2;
   for (const b of balls) {
     // Left / right cushions: pocket openings are at corners and middle (y-zones).
     const inSideJawY = b.y < JAW_C || b.y > PLAY_H_MM - JAW_C ||
@@ -1792,6 +1858,9 @@ document.addEventListener('keydown', e => {
 
   if ((e.key === 'h' || e.key === 'H') && !isMod) {
     shadow.getElementById('hide-btn').click();
+  }
+  if ((e.key === 'd' || e.key === 'D') && !isMod) {
+    shadow.getElementById('debug-btn').click();
   }
 });
 

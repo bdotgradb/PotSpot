@@ -137,13 +137,43 @@ class SnookerDetector {
     let lo = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [38,50,55,0]);
     let hi = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [88,255,225,255]);
     cv.inRange(hsv, lo, hi, mask);
-    hsv.delete(); lo.delete(); hi.delete();
+    lo.delete(); hi.delete();
 
     // 4×4 kernel at 1/4 scale ≡ 16×16 at full res
     let k = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(4, 4));
     cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, k);
     cv.morphologyEx(mask, mask, cv.MORPH_OPEN,  k);
     k.delete();
+
+    // Sample baize HSV from masked pixels — store the median for reuse by
+    // downstream filters (e.g. spurious-green rejection).  Uses the 1/4-scale
+    // hsv that's already in memory.
+    {
+      const hBins = new Uint32Array(180);
+      const sBins = new Uint32Array(256);
+      const vBins = new Uint32Array(256);
+      const mdata = mask.data, hdata = hsv.data;
+      let n = 0;
+      for (let i = 0; i < mdata.length; i++) {
+        if (!mdata[i]) continue;
+        const p = i * 3;  // hsv is 3-channel CV_8UC3
+        hBins[hdata[p]]++;
+        sBins[hdata[p + 1]]++;
+        vBins[hdata[p + 2]]++;
+        n++;
+      }
+      const median = (bins) => {
+        const half = n >> 1;
+        let acc = 0;
+        for (let i = 0; i < bins.length; i++) {
+          acc += bins[i];
+          if (acc >= half) return i;
+        }
+        return 0;
+      };
+      this.baizeHsv = n > 100 ? { H: median(hBins), S: median(sBins), V: median(vBins), n } : null;
+    }
+    hsv.delete();
 
     let contours = new cv.MatVector(), hier = new cv.Mat();
     cv.findContours(mask, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
@@ -492,6 +522,132 @@ class SnookerDetector {
     return playAreaCorners;
   }
 
+  // ── Top/bottom cushion nose refinement ───────────────────────────────────────
+  // After calcCushionLines the top/bottom playing-area lines are purely
+  // calculated (frame corners + cushionWidth push), so a wonky frame fit
+  // propagates directly into the cushion line.  This method re-detects each
+  // horizontal cushion independently using a ±1 % frame-height strip around
+  // the current estimated position:
+  //
+  //  • Per column in [leftX … rightX]: scan the strip row by row and record
+  //    the row with the maximum |ΔV| (absolute V difference between adjacent
+  //    rows).  No threshold — every column contributes its best candidate.
+  //  • RANSAC (y = mx + b) on the candidates to find a consistent line,
+  //    then OLS refine on inliers.  Low inlier tolerance (2 px) because
+  //    the strip is already narrow.
+  //  • If the fit succeeds and lies within ±3 % frame height of the estimate,
+  //    replace the four affected corners; otherwise keep the original.
+  //
+  // Returns pac unchanged if refinement is skipped or fails.
+  _refineHorizontalCushions(gray, pac) {
+    if (!gray) return pac;
+    const td = this.tableData;
+    if (!td.corners || !td.noseLeft || !td.noseRight) return pac;
+
+    const frameSpan   = td.corners.bl.y - td.corners.tl.y;
+    const MAX_DRIFT   = frameSpan * 0.03;               // reject fit if it moved too far
+    const RANSAC_ITER = 600;
+    const INLIER_TOL  = 2;   // px — tight because we're already in a narrow strip
+    const MIN_INLIERS = 0.4; // fraction of columns needed
+
+    // Linear interpolation of a corner pair across columns.
+    const interpY = (ptL, ptR, x) =>
+      ptL.y + (x - ptL.x) * (ptR.y - ptL.y) / (ptR.x - ptL.x);
+
+    // RANSAC line fit (y = m*x + b) on {x, y} points.
+    // Returns {m, b} or null.
+    const ransacLine = (pts) => {
+      if (pts.length < 4) return null;
+      let bestM = 0, bestB = 0, bestN = 0;
+      for (let iter = 0; iter < RANSAC_ITER; iter++) {
+        const i = pts[Math.floor(Math.random() * pts.length)];
+        const j = pts[Math.floor(Math.random() * pts.length)];
+        if (i === j) continue;
+        const dx = j.x - i.x;
+        if (Math.abs(dx) < 2) continue;
+        const m = (j.y - i.y) / dx;
+        const b = i.y - m * i.x;
+        let n = 0;
+        for (const p of pts) if (Math.abs(p.y - (m * p.x + b)) <= INLIER_TOL) n++;
+        if (n > bestN) { bestM = m; bestB = b; bestN = n; }
+      }
+      if (bestN < pts.length * MIN_INLIERS) return null;
+      // OLS refine on inliers
+      const ins = pts.filter(p => Math.abs(p.y - (bestM * p.x + bestB)) <= INLIER_TOL);
+      let sx = 0, sy = 0, sxx = 0, sxy = 0;
+      for (const p of ins) { sx += p.x; sy += p.y; sxx += p.x*p.x; sxy += p.x*p.y; }
+      const n2 = ins.length, den = n2*sxx - sx*sx;
+      if (Math.abs(den) < 1) return null;
+      return { m: (n2*sxy - sx*sy)/den, b: (sy*sxx - sx*sxy)/den };
+    };
+
+    // For top and bottom, run the strip scan and attempt a fit.
+    // side: 'top' uses pac.tl/tr, 'bottom' uses pac.bl/br.
+    const refineSide = (side) => {
+      const isTop  = side === 'top';
+      const ptL    = isTop ? pac.tl : pac.bl;
+      const ptR    = isTop ? pac.tr : pac.br;
+      const frameL = isTop ? td.corners.tl : td.corners.bl;
+      const frameR = isTop ? td.corners.tr : td.corners.br;
+
+      // Strip half-width = half the frame→cushion distance, averaged across the
+      // two corners.  Keeps the top strip from reaching the frame/baize edge
+      // (which would otherwise dominate the V gradient), and likewise keeps the
+      // bottom strip away from the frame.
+      const distL = Math.abs(ptL.y - frameL.y);
+      const distR = Math.abs(ptR.y - frameR.y);
+      const stripHalf = Math.max(3, Math.round((distL + distR) / 4));
+
+      // Column range: between nose lines at the estimated cushion y, clamped to image.
+      const xStart = Math.round(Math.max(0,           Math.min(ptL.x, ptR.x)));
+      const xEnd   = Math.round(Math.min(gray.cols-1, Math.max(ptL.x, ptR.x)));
+      if (xEnd - xStart < 10) return null;
+
+      const candidates = [];
+      for (let x = xStart; x <= xEnd; x++) {
+        // Strip bounds for this column, following the estimated cushion slope.
+        const baseY  = Math.round(interpY(ptL, ptR, x));
+        const yLo    = Math.max(1,           baseY - stripHalf);
+        const yHi    = Math.min(gray.rows-2, baseY + stripHalf);
+        if (yHi <= yLo) continue;
+
+        // Find row with maximum |ΔV| in the strip.
+        let bestRow = yLo, bestDV = 0;
+        for (let y = yLo; y <= yHi; y++) {
+          const dv = Math.abs(gray.ucharPtr(y+1, x)[0] - gray.ucharPtr(y-1, x)[0]);
+          if (dv > bestDV) { bestDV = dv; bestRow = y; }
+        }
+        candidates.push({ x, y: bestRow });
+      }
+
+      const fit = ransacLine(candidates);
+      if (!fit) return null;
+
+      // Check the fitted line hasn't drifted more than MAX_DRIFT from the estimate.
+      const newYatL = fit.m * ptL.x + fit.b;
+      const newYatR = fit.m * ptR.x + fit.b;
+      if (Math.abs(newYatL - ptL.y) > MAX_DRIFT || Math.abs(newYatR - ptR.y) > MAX_DRIFT) return null;
+
+      return { newL: { x: ptL.x, y: newYatL }, newR: { x: ptR.x, y: newYatR } };
+    };
+
+    const newTop = refineSide('top');
+    const newBot = refineSide('bottom');
+
+    if (!newTop && !newBot) return pac;
+
+    const refined = { ...pac };
+    if (newTop) {
+      refined.tl = newTop.newL;
+      refined.tr = newTop.newR;
+    }
+    if (newBot) {
+      refined.bl = newBot.newL;
+      refined.br = newBot.newR;
+    }
+    return refined;
+  }
+
   // ── Cushion-fraction position mapping (no homography) ────────────────────────
   // Interpolate x on a {x1,y1,x2,y2} line at a given image row y.
   lineX(line, y) {
@@ -503,27 +659,33 @@ class SnookerDetector {
   // Convert a ball-top pixel (topX, topY) to real-world mm on the playing surface.
   //
   // x: fraction between the two cushion-nose lines × tableWidth (linear, ~3.6 mm/px jitter).
-  // y: numerical integral of tableWidth / (W(y) * sin(viewAngle(y))) dy from frame top.
-  //    W(y) gives the x-scale; dividing by sin(viewAngle) corrects for y-foreshortening.
-  //    y=0 is the baulk/D end; cushionWidth offset maps frame-top → playing-surface start.
+  // y: numerical integral of 1/W(y)² from the levelled top cushion nose to topY,
+  //    normalised so the full cushion-nose-to-cushion-nose span = tableHeight.
+  //    y=0 at the top cushion nose, y=tableHeight at the bottom cushion nose.
+  //    No cushionWidth term — bounds come directly from the detected cushion positions.
   pixelToTableMm(topX, topY) {
     const td = this.tableData;
-    const L  = td.noseLeft, R = td.noseRight;
-    const lx = this.lineX(L, topY);
-    const rx = this.lineX(R, topY);
+    // x uses the raw row (perspective fraction between the nose lines at the
+    // ball's actual image row). y is sheared to the right-cushion reference
+    // column before the integral lookup, so camera roll (and any residual
+    // top/bottom tilt) maps to the same y_mm regardless of x position.
+    const lx = this.lineX(td.noseLeft,  topY);
+    const rx = this.lineX(td.noseRight, topY);
     const W  = rx - lx;
     if (W <= 0) return { x: 0, y: 0 };
 
-    // x: simple fraction
     const x_mm = (topX - lx) / W * this.tableWidth;
 
-    // y: look up precomputed integral, fall back to linear if unavailable
+    const sheared = td.shearPt ? td.shearPt({ x: topX, y: topY }) : { x: topX, y: topY };
+
     let y_mm;
     if (td.yIntegral && td.yIntegral.rows.length > 1) {
-      y_mm = -td.cushionWidth + this._lookupYIntegral(topY);
+      y_mm = this._lookupYIntegral(sheared.y);
     } else {
-      const frameH = td.corners.bl.y - td.corners.tl.y;
-      y_mm = -td.cushionWidth + (topY - td.corners.tl.y) / (frameH || 1) * (this.tableHeight + 2 * td.cushionWidth);
+      // Fallback: linear interpolation along the right cushion column.
+      const pac = td.playAreaCorners;
+      const spanH = (pac.br.y - pac.tr.y) || 1;
+      y_mm = (sheared.y - pac.tr.y) / spanH * this.tableHeight;
     }
 
     return { x: x_mm, y: y_mm };
@@ -957,20 +1119,32 @@ class SnookerDetector {
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const area = cv.contourArea(c);
-      if (area < 2) { c.delete(); continue; }
+      // boundingRect before the area gate: a 1px-tall slit has shoelace area=0
+      // (all contour points collinear) but a valid bounding rect.  MORPH_CLOSE
+      // dilates the slit to 3px then erodes it back to 1px, so this survives
+      // thresholding but gets area=0 from the shoelace formula.
+      const rect = cv.boundingRect(c);
+      if (area < 2 && rect.width * rect.height < 2) { c.delete(); continue; }
       const M = cv.moments(c, false);
-      if (M.m00 < 1) { c.delete(); continue; }
-      // Offset centroid back to full-image coordinates.
-      const hxC = M.m10 / M.m00 + rx;
-      const hyC = M.m01 / M.m00 + ry;
-      const hr = Math.sqrt(area / Math.PI);
+      // For a 1px-tall contour M.m00=0; fall back to bounding-rect centre.
+      let hxC, hyC, hr;
+      if (M.m00 > 1) {
+        hxC = M.m10 / M.m00 + rx;
+        hyC = M.m01 / M.m00 + ry;
+        hr = Math.sqrt(area / Math.PI);
+      } else {
+        hxC = rect.x + rect.width  / 2 + rx;
+        hyC = rect.y + rect.height / 2 + ry;
+		hr = Math.sqrt(rect.width^2+rect.height^2);
+      }
       const er = this.lookupR(hyC, tTop, tBot);
-      if (hr < Math.max(0.8, er * 0.08)) { c.delete(); continue; } // min ~8% of ball radius
+      // A long thin slit specular has low area but significant extent — use
+      // max bounding dimension / 2 for the min-size filter so it isn't discarded.
+      if (hr < er * 0.05) { c.delete(); continue; } // min ~8% of ball radius
       if (hr > er) { c.delete(); continue; }
       const large = hr > er * 0.4;
       let hx = hxC, hy = hyC;
       if (large) {
-        const rect = cv.boundingRect(c);
         hy = rect.y + ry;  // offset back to full-image y
       }
       c.delete();
@@ -1021,29 +1195,52 @@ class SnookerDetector {
     const EDGE_DH = 10, EDGE_DV = 20, BAIZE_MIN = 3, BAIZE_MIN_FRAC = 0.70;
     const edgePts = [];
     let baizyCols = 0;
-    if (earlyColour == "Yellow" || earlyColour == "Pink" ) {
+    if (earlyColour?.name == "Yellow" || earlyColour?.name == "Pink" ) {
 	    hr = 1;
-	    vEdgeThresh = 150;
+	    vEdgeThresh = 135;
 	}
+
+    // H-distance method: walk down each column treating pixels as baize until
+    // their hue has moved 2/3 of the way from the baize centre to the ball's
+    // hue (i.e. is within 1/3 of the gap from ballH). More robust than per-
+    // pixel deltas when streams are blurry and the baize→ball transition is
+    // spread over several rows. Only used for colours with a meaningful H;
+    // Black/White/unknown still go through the original dH/dV method.
+    const BALL_H_TABLE = { Red: 5, Pink: 5, Yellow: 27, Brown: 11, Blue: 110 };
+    const ballH = BALL_H_TABLE[earlyColour?.name];
+    const BAIZE_H = this.baizeHsv ;
+    const circDist = (a, b) => {
+      const d = Math.abs(a - b);
+      return d > 90 ? 180 - d : d;
+    };
+    const triggerThresh = ballH !== undefined
+      ? 20 : null;
 
     for (let x = 0; x < cols; x++) {
       let prevH = -1, prevV = -1, baizeCount = 0, edgeFound = false;
-      for (let y = 0; y < rows; y += 2) {
+      for (let y = 0; y < rows; y++) {
         const dhx = x - hxLocal, dhy = y - hyLocal;
         if (dhx * dhx + dhy * dhy < hr * hr) { prevH = -1; prevV = -1; continue; }
         const px = hsvMat.ucharPtr(y, x);
         const H = px[0], S = px[1], V = px[2];
-        if (V < 60 && earlyColour?.name !== 'Black') { prevH = -1; prevV = -1; continue; }
-        if (H >= 38 && H <= 88 && S > 40 && V > 60) baizeCount++;
-        if (!edgeFound && prevH >= 0) {
-          const dH = Math.min(Math.abs(H - prevH), 179 - Math.abs(H - prevH));
-          const dV = Math.abs(V - prevV);
-          if ((dH > EDGE_DH || dV > EDGE_DV) && S > 20) {
-            if (V < vEdgeThresh && earlyColour?.name !== 'Black' && earlyColour?.name !== 'Brown') {
-              prevH = H; prevV = V; continue;
+        //if (V < 60 && earlyColour?.name !== 'Black') { prevH = -1; prevV = -1; continue; }
+        if (H >= 40 && H <= 60 && S > 40 && V > 60) baizeCount++;
+        if (!edgeFound) {
+          if (triggerThresh !== null) {
+            if (circDist(H, ballH) < triggerThresh || V <= 70) {
+              edgePts.push({ x, y: Math.max(0, y - 1) });
+              edgeFound = true;
             }
-            edgePts.push({ x, y: Math.max(0, y - 1) });
-            edgeFound = true;
+          } else if (prevH >= 0) {
+            const dH = Math.min(Math.abs(H - prevH), 179 - Math.abs(H - prevH));
+            const dV = Math.abs(V - prevV);
+            if ((dH > EDGE_DH || dV > EDGE_DV) && S > 20) {
+              if (V < vEdgeThresh && earlyColour?.name !== 'Black' && earlyColour?.name !== 'Brown') {
+                prevH = H; prevV = V; continue;
+              }
+              edgePts.push({ x, y: Math.max(0, y - 1) });
+              edgeFound = true;
+            }
           }
         }
         prevH = H; prevV = V;
@@ -1071,7 +1268,7 @@ class SnookerDetector {
     let topY = topPts[0].y;
 
     // If top X deviates too far from mat centre column, override
-    if (Math.abs(topX - centreX) > 0.2 * er) {
+    if (Math.abs(topX - centreX) > 0.3 * er) {
       topX = centreX;
       const nearPts = edgePts.filter(p => p.x >= centreX - 1 && p.x <= centreX + 1);
       if (nearPts.length >= 2) {
@@ -1080,7 +1277,7 @@ class SnookerDetector {
         return null;
       }
     }
-
+	//topY = topY+1;
     return { topX, topY, edgePts };
   }
 
@@ -1167,39 +1364,69 @@ class SnookerDetector {
     const tooLargeForMedian = d =>
       d.highlight.large || d.highlight.hr > d.r * MEDIAN_HR_FRAC;
 
-    // Build the offset model exclusively from edge-detected (non-recovered,
-    // non-large) balls — recovered balls have dx=dy=0 which would poison the
-    // model if included.
+    // Offsets are stored as fractions of the ball radius so the model scales
+    // with perspective (a recovered ball at the near end gets a bigger pixel
+    // correction than one at the far end). dx is also modelled as a function
+    // of x because the specular reflection shifts horizontally with the ball's
+    // position relative to the table lights, so a single median would bias the
+    // correction toward whichever side of the table the anchors are on.
     const anchors = [];
     for (const d of circles) {
       if (!d.highlight || tooLargeForMedian(d) || d.recovered) continue;
       anchors.push({
-        dx: d.cx - d.highlight.hx,
-        dy: (d.cy - d.r) - d.highlight.hy,
+        x:      d.highlight.hx,
+        dxFrac: (d.cx - d.highlight.hx) / d.r,
+        dyFrac: ((d.cy - d.r) - d.highlight.hy) / d.r,
       });
     }
 
     if (anchors.length < 2) return { detections: circles, mDx: null, mDy: null };
 
-    const mDx = this.median(anchors.map(a => a.dx));
-    const mDy = this.median(anchors.map(a => a.dy));
+    const mDyFrac = this.median(anchors.map(a => a.dyFrac));
 
-    // Apply the median offset to recovered balls; leave all others as-is.
+    // Linear fit dxFrac = a + b * x across the anchors. With degenerate x
+    // spread (all anchors clustered at one column) or a wild slope, fall back
+    // to a constant median.
+    const n  = anchors.length;
+    const mx = anchors.reduce((s, a) => s + a.x,      0) / n;
+    const my = anchors.reduce((s, a) => s + a.dxFrac, 0) / n;
+    let num = 0, den = 0;
+    for (const a of anchors) {
+      const dx = a.x - mx;
+      num += dx * (a.dxFrac - my);
+      den += dx * dx;
+    }
+    let dxA, dxB;
+    // Slope cap: ≤ 0.5 of a radius per 1000 px of horizontal travel. Stops a
+    // pair of noisy anchors at similar X from producing an extrapolation that
+    // shoves far-away recovered balls right off the table.
+    const SLOPE_MAX = 0.5 / 1000;
+    if (den < 1) {
+      dxA = my; dxB = 0;
+    } else {
+      dxB = num / den;
+      if (Math.abs(dxB) > SLOPE_MAX) dxB = Math.sign(dxB) * SLOPE_MAX;
+      dxA = my - dxB * mx;
+    }
+    const dxFracAt = x => dxA + dxB * x;
+
     const detections = circles.map(d => {
-      if (!d.highlight || (d.adjusted && tooLargeForMedian(d))) return d;
+      if (!d.highlight || d.adjusted || tooLargeForMedian(d)) return d;
       let madj = 1;
       if (d.highlight.hr > d.r * MEDIAN_HR_FRAC) {
         // highlight cutoff divided by (actual highlight size*4) seems to work, but adjust to taste
         // Below, we multiply the median adjustment by this amount before applying
-      	madj = (d.r * MEDIAN_HR_FRAC)/(4*d.highlight.hr); 
+      	madj = (d.r * MEDIAN_HR_FRAC)/(4*d.highlight.hr);
       }
+      const dxPx = dxFracAt(d.highlight.hx) * d.r;
+      const dyPx = mDyFrac * d.r * madj;
       return { ...d,
-        cx: d.highlight.hx + mDx,
-        cy: d.highlight.hy + mDy*madj + d.r,
+        cx: d.highlight.hx + dxPx,
+        cy: d.highlight.hy + dyPx + d.r,
       };
     });
 
-    return { detections, mDx, mDy };
+    return { detections, mDx: dxA, mDy: mDyFrac };
   }
 
   // ── Side-edge refinement for isolated balls ──────────────────────────────────
@@ -1212,7 +1439,7 @@ class SnookerDetector {
     const ISO_R_FACTOR  = 2.2;   // 1.1 ball-widths = 2.2 * er
     const Y_TOL_FRAC    = 0.3;
     const X_TOL_FRAC    = 0.4;
-    const MAX_MOVE_FRAC = 0.25;
+    const MAX_MOVE_FRAC = 0.3;
 
     if (this.debugOn) this._sideDebug = [];
 
@@ -1302,7 +1529,7 @@ class SnookerDetector {
 	    // Yellow often gets located too low, so take it towards min side Y
         newCy = (newCy + Math.min(leftEdgePt.y,rightEdgePt.y))/2;
 	  }
-      if (newCy < cy && h.earlyColour.name != 'Yellow') {
+      if (newCy < cy && h.earlyColour?.name != 'Yellow') {
       	// Rarely do we want to move balls upwards, put it back
       	newCy = cy;
       }
@@ -1367,8 +1594,8 @@ class SnookerDetector {
     if ((H < 15 || H > 163) && S > 90)          return this.COLOURS[7]; // Red
     if (H >= 5  && H < 30 && S > 120 && V < 180) return this.COLOURS[3]; // Brown
     if (H >= 18 && H < 36 && S > 110)           return this.COLOURS[1]; // Yellow
-    if (H >= 38 && H < 78 && S > 50 && V < 168) return this.COLOURS[2]; // Green
     if (H >= 95 && H < 128 && S > 70)           return this.COLOURS[4]; // Blue
+    if (H >= 38 && H < 90 && S > 50 && V < 168) return this.COLOURS[2]; // Green
     if (V > 140 && S < 150)                      return this.COLOURS[0]; // White
     if (this.debugOn) console.log(H,S,V);
     return { name:'?', swatch:'#888888' };
@@ -1504,13 +1731,18 @@ class SnookerDetector {
   //      or if its centre lies outside the play area (on the cushion face).
   //   2. Shape: run a low-threshold HoughCircles on a gray ROI centred on the
   //      detection; reject if no circle of roughly the right radius is found.
-  _filterSpuriousGreen(detections, gray) {
+  _filterSpuriousGreen(detections, gray, hsv) {
     const OVERLAP_DIST = 1.8;   // ×r — reject if another ball centre is this close
     const HOUGH_PARAM1 = 30;    // Canny high threshold (low = sensitive edges)
     const HOUGH_PARAM2 = 10;    // accumulator threshold (low = accept weak circles)
     const HOUGH_R_LO   = 0.8;  // min accepted radius as fraction of expected r
     const HOUGH_R_HI   = 1.2;  // max accepted radius as fraction of expected r
     const HOUGH_REACH  = 1.3;   // max distance (×r) from expected centre to accepted circle
+    const BAIZE_H_TOL  = 5;     // ±degrees from baize H to count a pixel as baize
+    const BAIZE_FRAC   = 0.25;  // reject if >this fraction of disc is baize-hued
+
+    const baizeH = this.baizeHsv ? this.baizeHsv.H : null;
+    const circDist = (a, b) => { const d = Math.abs(a - b); return d > 90 ? 180 - d : d; };
 
     return detections.filter(d => {
       if (d.colour.name !== 'Green') return true;
@@ -1527,6 +1759,32 @@ class SnookerDetector {
       if (!this._inPlayArea(cx, cy)) {
         if (this.debugOn) console.log('[green] rejected: outside play area at', Math.round(cx), Math.round(cy));
         return false;
+      }
+
+      // 1c. Disc is mostly baize-hued — a real green ball is darker / more
+      // saturated than the baize and shouldn't have >BAIZE_FRAC of its disc
+      // sitting within BAIZE_H_TOL° of the measured baize hue.
+      if (hsv && baizeH !== null) {
+        const r2 = r * r;
+        const x0 = Math.max(0, Math.round(cx - r));
+        const y0 = Math.max(0, Math.round(cy - r));
+        const x1 = Math.min(hsv.cols - 1, Math.round(cx + r));
+        const y1 = Math.min(hsv.rows - 1, Math.round(cy + r));
+        let total = 0, baizeCount = 0;
+        for (let y = y0; y <= y1; y++) {
+          for (let x = x0; x <= x1; x++) {
+            const dx = x - cx, dy = y - cy;
+            if (dx * dx + dy * dy > r2) continue;
+            const px = hsv.ucharPtr(y, x);
+            total++;
+            if (circDist(px[0], baizeH) <= BAIZE_H_TOL) baizeCount++;
+          }
+        }
+        if (total > 0 && baizeCount / total > BAIZE_FRAC) {
+          if (this.debugOn) console.log('[green] rejected: ' + Math.round(100 * baizeCount / total)
+            + '% baize-hued (H≈' + baizeH + ') at', Math.round(cx), Math.round(cy));
+          return false;
+        }
       }
 
       // 2. Shape check: look for a circle of roughly the right radius in gray.
@@ -1656,7 +1914,7 @@ class SnookerDetector {
     }
 
     // Multiple reds: only attempt outlier rescue when Yellow + Green are present.
-    if (!hasName('Yellow') || !hasName('Green')) return detections;
+    if (!hasName('Yellow') && !hasName('Green')) return detections;
 
     // Non-redness: min(H, 179-H) so 0 = pure red, higher = more orange/brown.
     const nonRedness = d => {
@@ -2158,6 +2416,34 @@ class SnookerDetector {
 
     const tableLines = this.detectTableEdgeLines(this.srcMat, tRect, hsv, gray);
 
+    // ── Tilt (camera-roll) measurement ────────────────────────────────────────
+    // The mm-mapping model assumes lines of constant table-y are horizontal image
+    // rows.  A slightly rolled camera breaks that, so measure the roll from the
+    // fitted frame top/bottom lines, weighted toward the top line because
+    // position errors are most visible at the perspective-compressed far end.
+    // The image itself is never rotated (resampling would soften the far-end
+    // cushion-nose edges and degrade fitInsetLine): instead the fitted geometry
+    // and each ball's pixel position are rotated analytically into "levelled"
+    // space for the y-integral and pixelToTableMm only — see the levelled-
+    // geometry block after calcCushionLines.  tiltDiffDeg records the top/bottom
+    // angle difference (the perspective-convergence residual no rotation can
+    // remove) for diagnostics.
+    this.rotationDeg = 0;
+    this.tiltDiffDeg = 0;
+    if (tableLines?.frame?.[0] && tableLines?.frame?.[1]) {
+      const TILT_TOP_WEIGHT = 0.2;   // weight of top-line angle in the roll estimate
+      const TILT_MIN_DEG    = 0.15;  // below this it's line-fit jitter — don't churn
+      const TILT_MAX_DEG    = 3;    // above this something is misdetected — don't trust it
+      const lineAngleDeg = l => Math.atan2(l.y2 - l.y1, l.x2 - l.x1) * 180 / Math.PI;
+      const topDeg = lineAngleDeg(tableLines.frame[0]);
+      const botDeg = lineAngleDeg(tableLines.frame[1]);
+      const roll = TILT_TOP_WEIGHT * topDeg + (1 - TILT_TOP_WEIGHT) * botDeg;
+      this.tiltDiffDeg = topDeg - botDeg;
+      if (Math.abs(roll) > TILT_MIN_DEG && Math.abs(roll) < TILT_MAX_DEG) {
+        this.rotationDeg = roll;
+      }
+    }
+
 
 
 
@@ -2176,12 +2462,42 @@ class SnookerDetector {
         corners: tableLines.corners,        // {tl,tr,bl,br} each {x,y}
       };
   	tableLines.playAreaCorners = this.calcCushionLines();
+      // Refine top/bottom cushion positions via V-channel edge scan in a
+      // ±1 % strip around the calculated line, independent of the frame fit.
+      tableLines.playAreaCorners = this._refineHorizontalCushions(gray, tableLines.playAreaCorners);
       this.tableData.playAreaCorners = tableLines.playAreaCorners;
+    const cushionOffset = 0; // Test, push bottom cushion down by this amount, see if it helps
   	tableLines.playArea[0] = {x1:tableLines.playAreaCorners.tl.x,y1:tableLines.playAreaCorners.tl.y,x2:tableLines.playAreaCorners.tr.x,y2:tableLines.playAreaCorners.tr.y};  // {x1,y1,x2,y2} TL->TR
-  	tableLines.playArea[1] = {x1:tableLines.playAreaCorners.bl.x,y1:tableLines.playAreaCorners.bl.y,x2:tableLines.playAreaCorners.br.x,y2:tableLines.playAreaCorners.br.y};  // {x1,y1,x2,y2} BL->BR
-  	tableLines.playArea[2] = {x1:tableLines.playAreaCorners.tl.x,y1:tableLines.playAreaCorners.tl.y,x2:tableLines.playAreaCorners.bl.x,y2:tableLines.playAreaCorners.bl.y};  // {x1,y1,x2,y2} TL->BL
-  	tableLines.playArea[3] = {x1:tableLines.playAreaCorners.tr.x,y1:tableLines.playAreaCorners.tr.y,x2:tableLines.playAreaCorners.br.x,y2:tableLines.playAreaCorners.br.y};  // {x1,y1,x2,y2} TR->BR
+  	tableLines.playArea[1] = {x1:tableLines.playAreaCorners.bl.x,y1:tableLines.playAreaCorners.bl.y+cushionOffset,x2:tableLines.playAreaCorners.br.x,y2:tableLines.playAreaCorners.br.y+cushionOffset};  // {x1,y1,x2,y2} BL->BR
+  	tableLines.playArea[2] = {x1:tableLines.playAreaCorners.tl.x,y1:tableLines.playAreaCorners.tl.y,x2:tableLines.playAreaCorners.bl.x,y2:tableLines.playAreaCorners.bl.y+cushionOffset};  // {x1,y1,x2,y2} TL->BL
+  	tableLines.playArea[3] = {x1:tableLines.playAreaCorners.tr.x,y1:tableLines.playAreaCorners.tr.y,x2:tableLines.playAreaCorners.br.x,y2:tableLines.playAreaCorners.br.y+cushionOffset};  // {x1,y1,x2,y2} TR->BR
 
+      // ── Vertical shear for camera roll ─────────────────────────────────────
+      // Replaces the analytic rotation: shears each ball's y based on its
+      // perspective-x fraction along the bottom cushion. If BL.y < BR.y the
+      // bottom cushion tilts down-to-the-right; a ball at frac=0 (left) gets
+      // its y increased by (BR.y − BL.y) so its effective y matches the
+      // right-cushion reference, and a ball at frac=1 gets 0 shift. This
+      // brings horizontal lines in the rotated table back to constant
+      // effective-y, decoupling the mm-y from the table's image-space tilt.
+      //
+      // Reference column: the right cushion. y-integral bounds are therefore
+      // pac.tr.y → pac.br.y so all sheared balls fall in the integral's range.
+      {
+        const pac = tableLines.playAreaCorners;
+        const dyBot = pac.br.y - pac.bl.y;   // vertical span of bottom cushion (signed)
+        const noseL = this.tableData.noseLeft;
+        const noseR = this.tableData.noseRight;
+        this.tableData.shearPt = (pt) => {
+          const lx = this.lineX(noseL, pt.y);
+          const rx = this.lineX(noseR, pt.y);
+          const W  = rx - lx;
+          if (W <= 0) return { x: pt.x, y: pt.y };
+          const frac = (pt.x - lx) / W;
+          return { x: pt.x, y: pt.y + (1 - frac) * dyBot };
+        };
+        this.tableData.shearDy = dyBot;
+      }
     }
   
     // Find expected ball width at various latitudes
@@ -2203,10 +2519,14 @@ class SnookerDetector {
     // where K = focalPx/H is unknown but can be solved by normalising:
     //   K·tableWidth²·∫(1/W²)dy = expectedSpan  →  K = expectedSpan/(tableWidth²·rawTotal)
     //
-    // This requires only the nose lines — no camera-model parameters.
+    // Built using the raw nose lines along image rows. The integration window
+    // runs from the right top cushion-nose corner to the right bottom corner
+    // (pac.tr.y → pac.br.y). The shear in shearPt brings every ball's y to
+    // this same reference column before lookup.
     if (this.tableData.noseLeft && this.tableData.noseRight &&
-        this.tableData.cushionWidth !== undefined) {
-      const tl_y = tableLines.corners.tl.y, bl_y = tableLines.corners.bl.y;
+        tableLines.playAreaCorners) {
+      const tl_y = tableLines.playAreaCorners.tr.y;
+      const bl_y = tableLines.playAreaCorners.br.y;
       const iRows = [], rawVals = [];
       let raw = 0, prevRow = tl_y;
       let prevW = this.lineX(this.tableData.noseRight, tl_y) - this.lineX(this.tableData.noseLeft, tl_y);
@@ -2221,8 +2541,8 @@ class SnookerDetector {
         prevRow = ii; prevW = W1;
         if (ii >= bl_y) break;
       }
-      // Scale so total = tableHeight + 2×cushionWidth (frame-top → frame-bottom span)
-      const expectedSpan = this.tableHeight + 2 * this.tableData.cushionWidth;
+      // Scale so the cushion-nose-to-cushion-nose span = tableHeight exactly.
+      const expectedSpan = this.tableHeight;
       const scale = raw > 0 ? expectedSpan / raw : 1;
       const iVals = rawVals.map(v => v * scale);
       this.tableData.yIntegral = { rows: iRows, vals: iVals };
@@ -2236,6 +2556,9 @@ class SnookerDetector {
       //
       // The yIntegral normalisation gives K = f/H = scale / tableWidth²,
       // so: sin(ψ(y)) = W(y) · tableWidth / scale  (no vanishing points needed).
+      // Levelled geometry for consistency with `scale`; rows keyed levelled,
+      // which is within a pixel or two of raw for the permitted roll range —
+      // negligible for the smoothly-varying angle profile lookupAngle reads.
       for (var i = tl_y; i < bl_y; i += yStep) {
         const yi  = Math.round(i);
         const W   = this.lineX(this.tableData.noseRight, i) - this.lineX(this.tableData.noseLeft, i);
@@ -2328,6 +2651,8 @@ class SnookerDetector {
         clearCheck:    cc,
         imgWidth:      this.srcMat.cols,
         imgHeight:     this.srcMat.rows,
+        rotationDeg:   this.rotationDeg,
+        tiltDiffDeg:   this.tiltDiffDeg,
         tRect:         tRect ? { x: tRect.x, y: tRect.y, w: tRect.width, h: tRect.height } : null,
         tableLines:    tableLines ? {
           frame: tableLines.frame, playArea: tableLines.playArea,
@@ -2372,7 +2697,14 @@ class SnookerDetector {
       d.topY   = Math.round(d.cy - d.r);
     }
 
-    detections = this._filterSpuriousGreen(detections, gray);
+	// Below commented-out is old hue-based green detection, replaced with baize-hue detection
+	//const channels = new cv.MatVector();
+	//cv.split(hsv, channels);
+	//const sChannel = channels.get(1);  // 0=H, 1=S, 2=V
+    //detections = this._filterSpuriousGreen(detections, sChannel);
+    //sChannel.delete();
+    //channels.delete();
+    detections = this._filterSpuriousGreen(detections, gray, hsv);
     detections = this._rescueWhite(detections, hsv);
     detections = this.dedupSingles(detections, hsv);
     detections = this._rescueBrown(detections, hsv);
@@ -2381,7 +2713,7 @@ class SnookerDetector {
     // cushion-fraction + log-integral mapping.  Perspective is only used for the
     // small ball-top-height correction (~16.5 mm above the cushion-nose plane).
     const td = this.tableData;
-    if (td.noseLeft && td.noseRight && td.cushionWidth !== undefined) {
+    if (td.noseLeft && td.noseRight && td.yIntegral) {
       // topY = cy - r is the image row of the ball-top silhouette point, which lies
       // at 3D position (x, y_ball − R·cosθ, R·(1+sinθ)).  pixelToTableMm maps that
       // to the z=35mm reference plane, giving:
@@ -2420,16 +2752,60 @@ class SnookerDetector {
     }));
 
     // Snapshot everything needed for the overlay debug canvas.
+    const _td = this.tableData;
+    const _diagRows = (_td?.noseLeft && _td?.corners && _td?.playAreaCorners) ? (() => {
+      const pac = _td.playAreaCorners;
+      const frameTop = _td.corners.tl.y;
+      const frameBot = _td.corners.bl.y;
+      const interpX = (topPt, botPt, y) => {
+        const t = (y - topPt.y) / (botPt.y - topPt.y);
+        return topPt.x + t * (botPt.x - topPt.x);
+      };
+      return [0.25, 0.5, 0.75, 1.0].map(frac => {
+        const y = Math.round(frameTop + frac * (frameBot - frameTop));
+        const noseW  = this.lineX(_td.noseRight, y) - this.lineX(_td.noseLeft, y);
+        const paLeft = interpX(pac.tl, pac.bl, y);
+        const paRight= interpX(pac.tr, pac.br, y);
+        const paW    = paRight - paLeft;
+        return {
+          frac,
+          y,
+          noseWidthPx:      Math.round(noseW),
+          paWidthPx:        Math.round(paW),
+          ballDiamNosePx:   Math.round(noseW * this.ballWidth / this.tableWidth * 10) / 10,
+          ballDiamPaPx:     Math.round(paW   * this.ballWidth / this.tableWidth * 10) / 10,
+          centerX:          Math.round((paLeft + paRight) / 2),
+        };
+      });
+    })() : null;
+    const _diag = (_td?.noseLeft && _td?.corners) ? {
+      cushionWidthMm: Math.round(_td.cushionWidth * 10) / 10,
+      rotationDeg:    Math.round(this.rotationDeg * 100) / 100,
+      tiltDiffDeg:    Math.round(this.tiltDiffDeg * 100) / 100,
+      shearDyPx:      _td.shearDy !== undefined ? Math.round(_td.shearDy * 10) / 10 : 0,
+      wTopPx: Math.round(this.lineX(_td.noseRight, _td.corners.tl.y) - this.lineX(_td.noseLeft, _td.corners.tl.y)),
+      wBotPx: Math.round(this.lineX(_td.noseRight, _td.corners.bl.y) - this.lineX(_td.noseLeft, _td.corners.bl.y)),
+      frameSpanPx: Math.round(_td.corners.bl.y - _td.corners.tl.y),
+      rows: _diagRows,
+    } : null;
     this.debugInfo = {
       clearCheck: this.tableData.clearCheck,
       imgWidth:  this.srcMat.cols,
       imgHeight: this.srcMat.rows,
+      rotationDeg: this.rotationDeg,
+      tiltDiffDeg: this.tiltDiffDeg,
+      diag: _diag,
       tRect:     tRect ? { x: tRect.x, y: tRect.y, w: tRect.width, h: tRect.height } : null,
       tableLines: tableLines ? {
         frame:           tableLines.frame,
         playArea:        tableLines.playArea,
         corners:         tableLines.corners,
         playAreaCorners: tableLines.playAreaCorners,
+        // Raw fitted nose lines, full frame-row span — unlike playArea[2]/[3]
+        // these are not truncated at the offset corners, so the overlay can
+        // show where the straight-line fit lands at the extreme bottom.
+        noseLines: (this.tableData?.noseLeft && this.tableData?.noseRight)
+          ? [this.tableData.noseLeft, this.tableData.noseRight] : [],
       } : null,
       highlights: highlights.map(h => ({ hx: h.hx, hy: h.hy, hr: h.hr, large: h.large })),
       rawDetections: detections.map(d => ({
